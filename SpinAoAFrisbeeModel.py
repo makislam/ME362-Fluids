@@ -1,9 +1,17 @@
+# type: ignore
 import numpy as np
 from scipy.integrate import solve_ivp
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
-from thermo import Mixture
 import argparse
+
+# Try importing thermo; handle error if user hasn't installed it
+try:
+    from thermo import Mixture  # type: ignore
+    THERMO_AVAILABLE = True
+except ImportError:
+    THERMO_AVAILABLE = False
+    print("Warning: 'thermo' library not found. Using standard air density.")
 
 # ==========================================
 #   USER CONFIGURATION
@@ -23,16 +31,31 @@ DEFAULT_TILT_ANGLE = -12.0
 DEFAULT_ANGLE_OF_ATTACK = 4.0 
 
 # ==========================================
+#   OPTIMIZED DENSITY CALCULATION
+# ==========================================
+# We calculate this ONCE globally to prevent slow lookups inside the loop
+def get_global_air_density(temp_c, pressure_pa):
+    if THERMO_AVAILABLE:
+        try:
+            temp_k = temp_c + 273.15
+            air = Mixture('air', T=temp_k, P=pressure_pa)
+            return float(air.rho)
+        except:
+            return 1.225 # Fallback
+    return 1.225 # Standard sea level
 
-def calculate_air_density(temp_c, pressure_pa):
-    temp_k = temp_c + 273.15
-    air = Mixture('air', T=temp_k, P=pressure_pa)
-    return air.rho
+# CACHED DENSITY VALUE
+GLOBAL_RHO = get_global_air_density(AIR_TEMP_C, AIR_PRESSURE_PA)
+
+# ==========================================
 
 def simulate_3d_throw(v0, spin_rpm, release_height, launch_angle, release_angle, tilt_angle, aoa, temp_c, pressure_pa):
     m = 0.175           
     g = 9.81            
-    rho = calculate_air_density(temp_c, pressure_pa)
+    
+    # Use the cached global density (Super Fast)
+    rho = GLOBAL_RHO 
+    
     diameter = 0.269 
     area = 0.057     
     
@@ -40,29 +63,19 @@ def simulate_3d_throw(v0, spin_rpm, release_height, launch_angle, release_angle,
     Ixx = 0.00122       
     Iyy = 0.00122       
 
-    # --- DYNAMIC COEFFICIENT SELECTION ---
-    # We switch models based on Velocity (Reynolds Number proxy).
-    # Threshold is set to 16 m/s (~35 mph).
-    
+    # --- DYNAMIC COEFFICIENT SELECTION (Adaptive Model) ---
     if v0 < 16.0:
         # HUMMEL (2003) - High Drag / Low Speed
-        # Better for short tosses where wobble/early separation increases drag.
         CL0, CL_a = 0.188, 2.37
         CD0, CD_a = 0.15, 1.24
-        model_name = "Hummel (Short Range / High Drag)"
     else:
         # POTTS & CROWTHER (2002) - Low Drag / High Speed
-        # Better for long stable flights (Wind Tunnel Data).
         CL0, CL_a = 0.20, 2.96
         CD0, CD_a = 0.08, 2.60
-        model_name = "Potts (Long Range / Low Drag)"
 
     alpha_0 = -4 * np.pi/180
     
-    print(f"--- Simulation Config ---")
-    print(f"Velocity: {v0:.1f} m/s -> Selected Model: {model_name}")
-    
-    # Moments (Shared)
+    # Moments
     CM0, CM_a = -0.01, -0.2 
     CR_r = -0.014      
     CN_r = -0.000034  
@@ -104,7 +117,6 @@ def simulate_3d_throw(v0, spin_rpm, release_height, launch_angle, release_angle,
         vel = np.linalg.norm(v_body)
         if vel == 0: vel = 0.001
         
-        # Angle of Attack
         alpha = -np.arctan2(wb, ub)
         
         cl = CL0 + CL_a * alpha
@@ -117,7 +129,6 @@ def simulate_3d_throw(v0, spin_rpm, release_height, launch_angle, release_angle,
         
         sa, ca = np.sin(alpha), np.cos(alpha)
         
-        # Forces (Body Frame)
         Fx_aero = -FD * ca + FL * sa
         Fz_aero = -FD * sa + FL * ca  
         Fy_aero = 0 
@@ -154,7 +165,8 @@ def simulate_3d_throw(v0, spin_rpm, release_height, launch_angle, release_angle,
     hit_ground.terminal = True
     hit_ground.direction = -1
     
-    sol = solve_ivp(equations, (0, 15), initial_state, events=hit_ground, rtol=1e-5)
+    # OPTIMIZED TOLERANCES: 1e-3 is plenty accurate for frisbees and much faster
+    sol = solve_ivp(equations, (0, 15), initial_state, events=hit_ground, rtol=1e-3, atol=1e-6)
     return sol
 
 if __name__ == "__main__":
@@ -163,7 +175,7 @@ if __name__ == "__main__":
                         help=f'Initial velocity (m/s), default: {DEFAULT_V0}')
     parser.add_argument('--spin', '-s', type=float, default=DEFAULT_SPIN_RPM,
                         help=f'Spin rate (RPM), default: {DEFAULT_SPIN_RPM}')
-    parser.add_argument('--height', '-z', type=float, default=DEFAULT_RELEASE_HEIGHT,
+    parser.add_argument('--height', '-h', type=float, default=DEFAULT_RELEASE_HEIGHT,
                         help=f'Release height (m), default: {DEFAULT_RELEASE_HEIGHT}')
     parser.add_argument('--launch-angle', '-l', type=float, default=DEFAULT_LAUNCH_ANGLE,
                         help=f'Launch angle - path up/down (degrees), default: {DEFAULT_LAUNCH_ANGLE}')

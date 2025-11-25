@@ -1,367 +1,212 @@
+# type: ignore
 import numpy as np
 from scipy.optimize import differential_evolution, minimize
 import matplotlib.pyplot as plt
-from SpinAoAFrisbeeModel import simulate_3d_throw
+# Import the simulation model
+try:
+    from frisbee_3d_model_final import simulate_3d_throw  # type: ignore
+except ImportError:
+    from SpinAoAFrisbeeModel import simulate_3d_throw  # type: ignore
 import time
 import sys
 import io
 from contextlib import redirect_stdout
 import os
+import argparse
 
 # ==========================================
 #   OPTIMIZATION CONFIGURATION
 # ==========================================
 
-# Fixed parameters
-FIXED_VELOCITY = 25.0  # m/s (keep constant)
-FIXED_RELEASE_HEIGHT = 1.0  # m (keep constant)
-
-# Air conditions
 AIR_TEMP_C = 25.0
 AIR_PRESSURE_PA = 101325
 
 # Parameter bounds for optimization
-# Format: (min, max)
 BOUNDS = {
-    'spin_rpm': (400, 1000),           # Spin rate (RPM)
-    'launch_angle': (10, 45),            # Launch angle (degrees)
-    'release_angle': (-20, 20),         # Release angle (degrees)
-    'tilt_angle': (-45, 45),             # Tilt angle (degrees)
-    'aoa': (-4, 20)                      # Angle of attack (degrees)
+    'spin_rpm': (400, 1100),           
+    'launch_angle': (5, 25),           # 5-25 deg is realistic for distance
+    'release_angle': (-20, 20),        # Aim Left/Right to compensate for turn
+    'tilt_angle': (-45, 45),           # Full range to find the true Hyzer angle
+    'aoa': (-4, 15)                    
 }
 
 # ==========================================
 #   OPTIMIZATION FUNCTIONS
 # ==========================================
 
-def objective_function(params):
+def objective_function(params, velocity, height):
     """
-    Objective function to minimize (negative distance for maximization)
-    
-    Parameters:
-        params: [spin_rpm, launch_angle, release_angle, tilt_angle, aoa]
-    
-    Returns:
-        Negative distance (for minimization)
+    Maximize Forward Distance (X) while penalizing Side Drift (Y).
     """
     spin_rpm, launch_angle, release_angle, tilt_angle, aoa = params
     
     try:
-        # Run simulation with suppressed output
+        # Suppress output
         with redirect_stdout(io.StringIO()):
             sol = simulate_3d_throw(
-                FIXED_VELOCITY, 
-                spin_rpm, 
-                FIXED_RELEASE_HEIGHT,
-                launch_angle, 
-                release_angle, 
-                tilt_angle, 
-                aoa,
-                AIR_TEMP_C, 
-                AIR_PRESSURE_PA
+                velocity, spin_rpm, height,
+                launch_angle, release_angle, tilt_angle, aoa,
+                AIR_TEMP_C, AIR_PRESSURE_PA
             )
         
-        # Extract distance
-        distance = sol.y[0, -1]
+        x_final = sol.y[0, -1]
+        y_final = sol.y[1, -1]
         
-        # Return negative distance (we want to maximize, but optimizer minimizes)
-        return -distance
+        # OBJECTIVE: Maximize X, but keep Y close to 0.
+        # Penalty factor: losing 1m of distance is worth fixing 2m of drift.
+        drift_penalty = 0.5 * abs(y_final)
         
-    except Exception as e:
-        # If simulation fails, return a large penalty
+        # If it goes backwards (negative X), massive penalty
+        if x_final < 0: return 1e6
+        
+        # We minimize the negative score
+        score = -(x_final - drift_penalty)
+        return score
+        
+    except Exception:
         return 1e6
 
-def run_optimization(method='differential_evolution', initial_guess=None):
-    """
-    Run optimization to find best throw parameters
-    
-    Parameters:
-        method: 'differential_evolution' (global) or 'nelder-mead' (local)
-        initial_guess: Starting point for local optimization
-    
-    Returns:
-        Optimization result
-    """
+def run_optimization(velocity, height, method='differential_evolution', popsize=10, maxiter=30, workers=-1, initial_guess=None):
     
     bounds_list = [
-        BOUNDS['spin_rpm'],
-        BOUNDS['launch_angle'],
-        BOUNDS['release_angle'],
-        BOUNDS['tilt_angle'],
-        BOUNDS['aoa']
+        BOUNDS['spin_rpm'], BOUNDS['launch_angle'],
+        BOUNDS['release_angle'], BOUNDS['tilt_angle'], BOUNDS['aoa']
     ]
     
     print("=" * 80)
-    print(f"OPTIMIZING THROW DISTANCE (V0 = {FIXED_VELOCITY} m/s, Height = {FIXED_RELEASE_HEIGHT} m)")
+    print(f"OPTIMIZING FOR MAX X-DISTANCE (V0 = {velocity} m/s)")
+    print(f"Constraint: Penalizing side drift to ensure straight flight.")
     print("=" * 80)
-    print(f"\nOptimization method: {method}")
-    print(f"\nParameter bounds:")
-    print(f"  Spin:          {BOUNDS['spin_rpm'][0]:.0f} - {BOUNDS['spin_rpm'][1]:.0f} RPM")
-    print(f"  Launch Angle:  {BOUNDS['launch_angle'][0]:.1f} - {BOUNDS['launch_angle'][1]:.1f} deg")
-    print(f"  Release Angle: {BOUNDS['release_angle'][0]:.1f} - {BOUNDS['release_angle'][1]:.1f} deg")
-    print(f"  Tilt Angle:    {BOUNDS['tilt_angle'][0]:.1f} - {BOUNDS['tilt_angle'][1]:.1f} deg")
-    print(f"  Angle of Attack:{BOUNDS['aoa'][0]:.1f} - {BOUNDS['aoa'][1]:.1f} deg")
-    print()
+    
+    optimizer_args = (velocity, height)
     
     if method == 'differential_evolution':
-        # Global optimization - optimized for speed
-        print(">>> OPTIMIZATION STARTING - Please wait...")
-        
-        # Calculate optimal number of workers (4-6 is best for most systems)
-        total_cores = os.cpu_count() or 4
-        num_workers = min(6, max(1, total_cores - 2))  # Use max 6 cores, leave 2 free
-        print(f">>> Using parallel processing with {num_workers} CPU cores\n")
-        
-        # Progress tracking
+        if workers == -1:
+            total_cores = os.cpu_count() or 4
+            workers = min(6, max(1, total_cores - 1)) 
+            
+        print(f">>> Global Search (PopSize={popsize}, MaxIter={maxiter}, Workers={workers})...")
         start_time = time.time()
-        best_distance = [0]
         iteration_count = [0]
-        max_iterations = 50  # Reduced from 100
-        popsize = 10  # Reduced from 15
-        total_evals = max_iterations * popsize * len(bounds_list)
         
         def callback(xk, convergence):
             iteration_count[0] += 1
-            # Don't call objective_function here - it's already been called by the optimizer
-            # Just track the best result from convergence
-            
-            # Progress bar with ASCII characters
-            progress = iteration_count[0] / max_iterations
-            bar_length = 40
+            progress = iteration_count[0] / maxiter
+            if progress > 1.0: progress = 1.0
+            bar_length = 30
             filled = int(bar_length * progress)
             bar = '#' * filled + '-' * (bar_length - filled)
             elapsed = time.time() - start_time
             
-            # Estimate time remaining
-            if progress > 0:
-                eta = (elapsed / progress) * (1 - progress)
-                sys.stdout.write(f'\r[{bar}] {progress*100:.1f}% | Iter {iteration_count[0]}/{max_iterations} | '
-                               f'Time: {elapsed:.1f}s | ETA: {eta:.1f}s    ')
-            else:
-                sys.stdout.write(f'\r[{bar}] {progress*100:.1f}% | Iter {iteration_count[0]}/{max_iterations} | '
-                               f'Time: {elapsed:.1f}s    ')
+            msg = f"\r[{bar}] {progress*100:.0f}% | Iter {iteration_count[0]}/{maxiter} | {elapsed:.1f}s"
+            sys.stdout.write(msg)
             sys.stdout.flush()
             return False
         
         result = differential_evolution(
             objective_function,
             bounds_list,
+            args=optimizer_args,
             strategy='best1bin',
-            maxiter=max_iterations,
+            maxiter=maxiter,
             popsize=popsize,
-            tol=0.01,
-            atol=0.1,  # Absolute tolerance for faster convergence
-            seed=42,
-            disp=False,
-            workers=num_workers,
+            tol=0.05,
+            workers=workers,
+            updating='deferred',
             callback=callback,
-            polish=True,
-            updating='deferred'
+            polish=True
         )
-        print()  # New line after progress bar
+        print()
     else:
-        # Local optimization - faster but may find local optimum
         if initial_guess is None:
-            # Use middle of bounds as initial guess
-            initial_guess = [(b[0] + b[1]) / 2 for b in bounds_list]
+            initial_guess = [800, 12.0, 5.0, 15.0, 4.0] # Guessing Positive Tilt for Hyzer
         
-        print("Running local optimization...\n")
+        print(">>> Local Search (Nelder-Mead)...")
         start_time = time.time()
-        
         result = minimize(
             objective_function,
             initial_guess,
+            args=optimizer_args,
             method='Nelder-Mead',
-            options={'disp': False, 'maxiter': 300}  # Reduced from 500
+            options={'disp': False, 'maxiter': 300}
         )
-        
-        elapsed = time.time() - start_time
-        print(f"Optimization completed in {elapsed:.1f}s")
     
     return result
 
-def display_results(result, elapsed_time=None):
-    """Display optimization results and run final simulation"""
-    
+def display_results(result, velocity, height, elapsed_time=None):
     optimal_params = result.x
-    spin_rpm, launch_angle, release_angle, tilt_angle, aoa = optimal_params
-    optimal_distance = -result.fun  # Convert back to positive
+    spin_rpm, launch, release, tilt, aoa = optimal_params
+    
+    # Run final sim to get real stats
+    sol = simulate_3d_throw(velocity, spin_rpm, height, launch, release, tilt, aoa, AIR_TEMP_C, AIR_PRESSURE_PA)
+    x_final = sol.y[0, -1]
+    y_final = sol.y[1, -1]
+    max_z = max(sol.y[2])
     
     print("\n" + "=" * 80)
-    print("OPTIMIZATION RESULTS")
+    print(f"RESULTS (Time: {elapsed_time:.1f}s)")
     print("=" * 80)
-    if elapsed_time:
-        print(f"\nTotal optimization time: {elapsed_time:.1f}s")
-    print(f"\nOptimal Parameters (V0 = {FIXED_VELOCITY} m/s, Height = {FIXED_RELEASE_HEIGHT} m):")
-    print(f"  Spin:           {spin_rpm:.1f} RPM")
-    print(f"  Launch Angle:   {launch_angle:.2f}°")
-    print(f"  Release Angle:  {release_angle:.2f}°")
-    print(f"  Tilt Angle:     {tilt_angle:.2f}°")
-    print(f"  Angle of Attack:{aoa:.2f}°")
-    print(f"\nOptimized Distance: {optimal_distance:.2f} m")
+    print(f"Optimal Parameters:")
+    print(f"  Spin:    {spin_rpm:.0f} RPM")
+    print(f"  Launch:  {launch:.2f}°")
+    print(f"  Release: {release:.2f}° (Aim)")
+    print(f"  Tilt:    {tilt:.2f}° (Bank)")
+    print(f"  AoA:     {aoa:.2f}°")
+    print("-" * 40)
+    print(f"Forward Distance (X): {x_final:.2f} m")
+    print(f"Side Drift (Y):       {y_final:.2f} m")
+    print(f"Max Height (Z):       {max_z:.2f} m")
     
-    # Run final simulation to get full trajectory
-    print("\nRunning final simulation with optimal parameters...")
-    sol = simulate_3d_throw(
-        FIXED_VELOCITY, 
-        spin_rpm, 
-        FIXED_RELEASE_HEIGHT,
-        launch_angle, 
-        release_angle, 
-        tilt_angle, 
-        aoa,
-        AIR_TEMP_C, 
-        AIR_PRESSURE_PA
-    )
-    
-    x, y, z = sol.y[0], sol.y[1], sol.y[2]
-    flight_time = sol.t[-1]
-    max_height = np.max(z)
-    drift = y[-1]
-    
-    print(f"\nFinal Results:")
-    print(f"  Distance:       {x[-1]:.2f} m")
-    print(f"  Drift:          {drift:.2f} m")
-    print(f"  Flight Time:    {flight_time:.2f} s")
-    print(f"  Max Height:     {max_height:.2f} m")
-    
-    # Plot optimal trajectory
-    plot_optimal_trajectory(x, y, z, optimal_params, optimal_distance)
-    
-    return optimal_params, x, y, z
+    plot_trajectory(sol.y[0], sol.y[1], sol.y[2], optimal_params, x_final)
 
-def plot_optimal_trajectory(x, y, z, params, distance):
-    """Plot the optimal trajectory"""
+def plot_trajectory(x, y, z, params, distance):
+    fig = plt.figure(figsize=(14, 6))
     
-    spin_rpm, launch_angle, release_angle, tilt_angle, aoa = params
-    
-    fig = plt.figure(figsize=(16, 5))
-    
-    # 3D view
+    # 3D View
     ax1 = fig.add_subplot(131, projection='3d')
-    ax1.plot(x, y, z, linewidth=2, color='red', label='Optimal Trajectory')
-    ax1.scatter(x[0], y[0], z[0], color='green', s=100, marker='o', label='Start')
-    ax1.scatter(x[-1], y[-1], z[-1], color='red', s=100, marker='x', label='End')
-    ax1.set_xlabel('Distance X (m)')
-    ax1.set_ylabel('Drift Y (m)')
-    ax1.set_zlabel('Height Z (m)')
-    ax1.set_title('Optimal 3D Trajectory')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
+    ax1.plot(x, y, z, linewidth=2, color='red')
+    ax1.scatter(x[0], y[0], z[0], color='green', label='Start')
+    ax1.scatter(x[-1], y[-1], z[-1], color='red', label='End')
+    ax1.plot([0, max(x)], [0, 0], [0, 0], 'k--', alpha=0.3)
+    ax1.set_title('3D Flight Path')
+    ax1.set_xlabel('X (Forward)')
+    ax1.set_ylabel('Y (Side)')
+    ax1.set_zlabel('Z (Height)')
     
-    # Top view
+    # Top View (Checking S-Curve)
     ax2 = fig.add_subplot(132)
-    ax2.plot(x, y, linewidth=2, color='red')
-    ax2.scatter(x[0], y[0], color='green', s=100, marker='o', label='Start')
-    ax2.scatter(x[-1], y[-1], color='red', s=100, marker='x', label='End')
-    ax2.axhline(0, color='black', linewidth=0.5, linestyle='--')
+    ax2.plot(x, y, linewidth=2, color='blue')
+    ax2.axhline(0, color='k', linestyle='--', alpha=0.5) # Centerline
+    ax2.scatter(x[-1], y[-1], color='red', marker='x')
+    ax2.set_title('Top View (Drift vs Distance)')
     ax2.set_xlabel('Distance X (m)')
     ax2.set_ylabel('Drift Y (m)')
-    ax2.set_title('Top View - Drift Pattern')
     ax2.grid(True, alpha=0.3)
-    ax2.legend()
     
-    # Side view
+    # Side View (Checking Height)
     ax3 = fig.add_subplot(133)
-    ax3.plot(x, z, linewidth=2, color='red')
-    ax3.scatter(x[0], z[0], color='green', s=100, marker='o', label='Start')
-    ax3.scatter(x[-1], z[-1], color='red', s=100, marker='x', label='End')
-    ax3.axhline(0, color='black', linewidth=0.5, linestyle='--')
+    ax3.plot(x, z, linewidth=2, color='green')
+    ax3.set_title('Side View (Height Profile)')
     ax3.set_xlabel('Distance X (m)')
     ax3.set_ylabel('Height Z (m)')
-    ax3.set_title('Side View - Flight Path')
     ax3.grid(True, alpha=0.3)
-    ax3.legend()
+    ax3.set_ylim(bottom=0)
     
-    # Add parameter info
-    param_text = (f"Optimal Parameters (V0={FIXED_VELOCITY} m/s, Height={FIXED_RELEASE_HEIGHT} m):\n"
-                  f"Spin: {spin_rpm:.1f} RPM\n"
-                  f"Launch: {launch_angle:.1f} deg, Release: {release_angle:.1f} deg\n"
-                  f"Tilt: {tilt_angle:.1f} deg, AoA: {aoa:.1f} deg\n"
-                  f"Distance: {distance:.2f} m")
-    fig.text(0.5, 0.02, param_text, ha='center', fontsize=9, 
-             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-    
-    plt.tight_layout(rect=[0, 0.08, 1, 1])
+    plt.tight_layout()
     plt.show()
 
-def compare_with_baseline(optimal_params, baseline_params=None):
-    """Compare optimal throw with a baseline throw"""
-    
-    if baseline_params is None:
-        # Default baseline (typical throw)
-        baseline_params = [600, 8.0, 0.0, -12.0, 4.0]
-    
-    print("\n" + "=" * 80)
-    print("COMPARISON: OPTIMAL vs BASELINE")
-    print("=" * 80)
-    
-    # Run baseline
-    print("\nBaseline throw:")
-    sol_base = simulate_3d_throw(
-        FIXED_VELOCITY, 
-        baseline_params[0], FIXED_RELEASE_HEIGHT,
-        baseline_params[1], baseline_params[2], 
-        baseline_params[3], baseline_params[4],
-        AIR_TEMP_C, AIR_PRESSURE_PA
-    )
-    baseline_distance = sol_base.y[0, -1]
-    baseline_drift = sol_base.y[1, -1]
-    print(f"  Distance: {baseline_distance:.2f} m")
-    print(f"  Drift:    {baseline_drift:.2f} m")
-    
-    # Run optimal
-    print("\nOptimal throw:")
-    sol_opt = simulate_3d_throw(
-        FIXED_VELOCITY, 
-        optimal_params[0], FIXED_RELEASE_HEIGHT,
-        optimal_params[1], optimal_params[2], 
-        optimal_params[3], optimal_params[4],
-        AIR_TEMP_C, AIR_PRESSURE_PA
-    )
-    optimal_distance = sol_opt.y[0, -1]
-    optimal_drift = sol_opt.y[1, -1]
-    print(f"  Distance: {optimal_distance:.2f} m")
-    print(f"  Drift:    {optimal_drift:.2f} m")
-    
-    # Improvement
-    improvement = optimal_distance - baseline_distance
-    improvement_pct = (improvement / baseline_distance) * 100
-    print(f"\nImprovement: +{improvement:.2f} m ({improvement_pct:.1f}%)")
-
-# ==========================================
-#   MAIN EXECUTION
-# ==========================================
-
 if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Optimize frisbee throw distance')
-    parser.add_argument('--method', '-m', type=str, default='differential_evolution',
-                        choices=['differential_evolution', 'nelder-mead'],
-                        help='Optimization method (default: differential_evolution)')
-    parser.add_argument('--velocity', '-v', type=float, default=14.0,
-                        help='Fixed initial velocity in m/s (default: 14.0)')
-    parser.add_argument('--compare', '-c', action='store_true',
-                        help='Compare with baseline throw')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--velocity', '-v', type=float, default=25.0, help='Throw velocity (m/s)')
+    parser.add_argument('--height', '-H', type=float, default=1.2, help='Release height (m)')
+    parser.add_argument('--fast', action='store_true')
+    parser.add_argument('--maxiter', type=int, default=30)
+    parser.add_argument('--popsize', type=int, default=10)
     
     args = parser.parse_args()
     
-    # Update fixed velocity if provided
-    FIXED_VELOCITY = args.velocity
+    method = 'nelder-mead' if args.fast else 'differential_evolution'
     
-    # Run optimization with timing
-    start_time = time.time()
-    result = run_optimization(method=args.method)
-    total_time = time.time() - start_time
-    
-    # Display and plot results
-    optimal_params, x, y, z = display_results(result, total_time)
-    
-    # Optional comparison
-    if args.compare:
-        compare_with_baseline(optimal_params)
-    
-    print("\n" + "=" * 80)
-    print("OPTIMIZATION COMPLETE")
-    print("=" * 80)
+    start = time.time()
+    res = run_optimization(args.velocity, args.height, method=method, maxiter=args.maxiter, popsize=args.popsize)
+    display_results(res, args.velocity, args.height, time.time() - start)
